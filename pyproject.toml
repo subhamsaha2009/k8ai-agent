@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "k8ai-agent"
+version = "1.0.0"
+description = "Conversational AI agent that manages your Kubernetes cluster using plain English — powered by Azure AI Foundry (GPT-4o)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Subham Saha", email = "subham.saha2009@gmail.com" }
+]
+keywords = ["kubernetes", "ai", "agent", "azure", "openai", "aks", "devops", "gpt-4o"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=2.0.0",
+    "kubernetes>=30.0.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/subhamsaha/k8AI"
+Repository = "https://github.com/subhamsaha/k8AI"
+"Bug Tracker" = "https://github.com/subhamsaha/k8AI/issues"
+
+[project.scripts]
+k8ai = "k8ai.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["k8ai*"]
