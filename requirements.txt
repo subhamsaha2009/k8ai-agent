@@ -1,4 +1,0 @@
-openai
-kubernetes
-python-dotenv
-rich
