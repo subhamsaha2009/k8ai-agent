@@ -1,6 +1,3 @@
-"""
-k8ai - Kubernetes AI Agent powered by Azure AI Foundry (GPT-4o)
-"""
+"""k8ai — AI-powered Kubernetes cluster management agent."""
 
-__version__ = "1.0.0"
-__author__ = "Subham Saha"
+__version__ = "0.1.0"

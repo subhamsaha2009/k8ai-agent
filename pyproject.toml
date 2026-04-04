@@ -1,45 +1,47 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "k8ai-agent"
-version = "1.0.0"
-description = "Conversational AI agent that manages your Kubernetes cluster using plain English — powered by Azure AI Foundry (GPT-4o)"
+version = "0.1.0"
+description = "AI-powered Kubernetes cluster management agent with AKS support"
 readme = "README.md"
-license = { text = "MIT" }
+license = {text = "MIT"}
+requires-python = ">=3.10"
 authors = [
-    { name = "Subham Saha", email = "subham.saha2009@gmail.com" }
+    {name = "Subham Saha"}
 ]
-keywords = ["kubernetes", "ai", "agent", "azure", "openai", "aks", "devops", "gpt-4o"]
+keywords = ["kubernetes", "k8s", "ai", "agent", "aks", "azure", "mcp"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "Topic :: System :: Systems Administration",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-requires-python = ">=3.10"
+
 dependencies = [
-    "openai>=2.0.0",
-    "kubernetes>=30.0.0",
-    "python-dotenv>=1.0.0",
-    "rich>=13.0.0",
+    "openai>=1.0",
+    "anthropic>=0.20",
+    "kubernetes>=28.0",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+    "keyring>=25.0",
+    "pyyaml>=6.0",
+    "mcp>=1.0",
 ]
 
-[project.urls]
-Homepage = "https://github.com/subhamsaha/k8AI"
-Repository = "https://github.com/subhamsaha/k8AI"
-"Bug Tracker" = "https://github.com/subhamsaha/k8AI/issues"
-
 [project.scripts]
-k8ai = "k8ai.main:main"
+k8ai = "k8ai.cli:main"
+k8ai-mcp = "k8ai.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/subhamsaha/k8ai-agent"
+Repository = "https://github.com/subhamsaha/k8ai-agent"
 
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["k8ai*"]
