@@ -266,12 +266,31 @@ def delete_service(name: str, namespace: str = "default") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  AZURE DOCS TOOLS — always safe
+#  DOCS + KNOWLEDGE BASE TOOLS — always safe
 # ═══════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
+def search_local_docs(query: str) -> str:
+    """Search locally synced Azure AKS and Kubernetes documentation. Prefer this over search_azure_docs."""
+    return json.dumps(k8s_tools.search_local_docs(query), default=str)
+
+
+@mcp.tool()
+def search_knowledge_base(query: str) -> str:
+    """Search your team's knowledge base — past incidents, runbooks, and team rules."""
+    return json.dumps(k8s_tools.search_knowledge_base(query), default=str)
+
+
+@mcp.tool()
+def add_to_knowledge_base(title: str, description: str, resolution: str = "",
+                          tags: str = "", category: str = "incident") -> str:
+    """Save a resolved incident or team rule to the knowledge base."""
+    return json.dumps(k8s_tools.add_to_knowledge_base(title, description, resolution, tags, category), default=str)
+
+
+@mcp.tool()
 def search_azure_docs(query: str) -> str:
-    """Search official Microsoft Learn documentation for Azure/AKS topics."""
+    """Search official Microsoft Learn documentation online (fallback). Prefer search_local_docs."""
     return json.dumps(k8s_tools.search_azure_docs(query), default=str)
 
 

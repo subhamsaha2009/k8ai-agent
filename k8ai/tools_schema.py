@@ -467,5 +467,74 @@ TOOLS = [
                 "required": ["command"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_local_docs",
+            "description": "Search locally synced Azure AKS and Kubernetes documentation. Use this when the user asks about Azure/AKS features, Kubernetes concepts, how-to guides, or best practices. Searches offline — no internet needed. If docs are not synced, falls back to online search. Prefer this over search_azure_docs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query. Examples: 'AKS addons', 'pod disruption budget', 'istio mTLS setup', 'horizontal pod autoscaler'"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge_base",
+            "description": "Search your team's internal knowledge base — past incidents, runbooks, postmortems, and team rules. Use this when an issue looks recurring ('has this happened before?'), when the user asks about team processes, or after diagnosing a problem to check for past resolutions. Also checks Azure AI Search if configured.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query. Examples: 'payment-service OOMKilled', 'certificate rotation process', 'scaling rules', 'deployment best practices'"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_to_knowledge_base",
+            "description": "Save a resolved incident, team rule, or runbook to the knowledge base for future reference. Use this after fixing an issue (ask the user first), or when the user explicitly asks to remember something. This data is searchable in future conversations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title. Example: 'payment-service OOMKilled — April 2026'"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What happened or what the rule is. Example: 'Pod crashed due to memory leak in connection pool v2.3.1'"
+                    },
+                    "resolution": {
+                        "type": "string",
+                        "description": "How it was fixed. Example: 'Upgraded to v2.3.2, set memory limit to 512Mi'"
+                    },
+                    "tags": {
+                        "type": "string",
+                        "description": "Space-separated tags for easier search. Example: 'oomkill payment-service memory'"
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["incident", "runbook"],
+                        "description": "Type of entry. 'incident' for past issues, 'runbook' for team rules and processes.",
+                        "default": "incident"
+                    }
+                },
+                "required": ["title", "description"]
+            }
+        }
     }
 ]

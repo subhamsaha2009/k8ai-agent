@@ -1408,3 +1408,65 @@ def analyze_aks_impact(command, resource_group=None, cluster_name=None):
             f"Check current config: az aks show -g {resource_group} -n {cluster_name}")
 
     return analysis
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LOCAL DOCS + KNOWLEDGE BASE SEARCH
+# ═══════════════════════════════════════════════════════════════════════════
+
+def search_local_docs(query):
+    """Search locally synced Azure and Kubernetes documentation.
+    Returns matching doc chunks ranked by relevance.
+    Run 'k8ai docs sync' first to download docs."""
+    try:
+        from k8ai.kb import search_docs, is_docs_synced
+        if not is_docs_synced():
+            return {
+                "error": "Docs not synced yet. Run 'k8ai docs sync' to download Azure + K8s docs.",
+                "query": query,
+            }
+        results = search_docs(query, limit=5)
+        if not results:
+            # Fallback to online search if local search returns nothing
+            return search_azure_docs(query)
+        return {"results": results, "query": query, "source": "local"}
+    except Exception as e:
+        # Fallback to online search on any error
+        return search_azure_docs(query)
+
+
+def search_knowledge_base(query):
+    """Search your team's knowledge base — past incidents, runbooks, and team rules.
+    Use this when an issue looks like something that may have happened before,
+    or when the user asks about team processes and conventions."""
+    try:
+        from k8ai.kb import search_knowledge_base as _search_kb, is_azure_search_configured, search_azure
+
+        results = _search_kb(query, limit=5)
+
+        # Also check Azure AI Search if configured
+        if is_azure_search_configured():
+            azure_results = search_azure(query, limit=3)
+            results.extend(azure_results)
+
+        if not results:
+            return {"message": "No matching incidents or runbooks found.", "query": query}
+        return {"results": results, "query": query}
+    except Exception as e:
+        return {"error": str(e), "query": query}
+
+
+def add_to_knowledge_base(title, description, resolution="", tags="", category="incident"):
+    """Save a resolved incident, runbook, or team rule to the knowledge base.
+    category: 'incident' for past issues, 'runbook' for team processes."""
+    try:
+        from k8ai.kb import add_incident, add_runbook
+
+        if category == "runbook":
+            add_runbook(title=title, content=f"{description}\n\n{resolution}".strip(), tags=tags)
+        else:
+            add_incident(title=title, description=description, resolution=resolution, tags=tags)
+
+        return {"status": "saved", "title": title, "category": category}
+    except Exception as e:
+        return {"error": str(e)}
