@@ -576,6 +576,132 @@ This prompts for your Azure AI Search endpoint, API key, and index name. Once co
 
 ---
 
+## RAG (Semantic Search)
+
+### What is RAG?
+
+RAG (Retrieval-Augmented Generation) lets K8AI understand the **meaning** of your question, not just match keywords.
+
+Without RAG (keyword only):
+- You search: "my pod keeps running out of memory"
+- Finds docs containing the words "pod", "memory"
+- **Misses** docs about "OOMKilled" or "resource limits" because those exact words aren't in your query
+
+With RAG (semantic):
+- You search: "my pod keeps running out of memory"
+- Converts your question to a **vector** (1536 numbers representing meaning)
+- Finds docs about "OOMKilled", "memory limits", "resource quotas" — because the **meaning** matches
+
+### Two Models Required
+
+RAG needs an **embedding model** in addition to your chat model. These are two different models:
+
+| Model | Purpose | Required for |
+|---|---|---|
+| `gpt-4o` | Chat — understands questions, calls tools, gives answers | K8AI agent (you already have this) |
+| `text-embedding-ada-002` | Embeddings — converts text into vectors for semantic search | RAG (deploy this separately) |
+
+> **Important:** gpt-4o alone is NOT enough for RAG. You must deploy `text-embedding-ada-002` alongside it. It uses the same endpoint and API key — no extra configuration needed.
+
+### Setting Up RAG
+
+#### Azure OpenAI Users
+
+1. Go to [Azure AI Foundry](https://ai.azure.com/)
+2. Open the **same Azure OpenAI resource** where your gpt-4o is deployed
+3. Go to **Deployments** → **Deploy model** → **Deploy base model**
+4. Search for **text-embedding-ada-002**
+5. Set deployment name to `text-embedding-ada-002`
+6. Click **Deploy**
+
+No new endpoint or API key needed — K8AI uses the same credentials for both models.
+
+#### OpenAI Users
+
+No extra setup — the embedding model is already available on your API key.
+
+#### Claude Users
+
+Anthropic Claude does not have an embedding model. Claude users get keyword search (FTS5 BM25), which still works well for specific technical terms.
+
+### Generating Embeddings
+
+After deploying the embedding model, run:
+
+```bash
+k8ai docs sync
+```
+
+This downloads docs AND generates embeddings for all ~10,000 chunks. Output:
+
+```
+╭──────── Done ────────╮
+│ Docs synced!         │
+│                      │
+│ AKS docs:  6392      │
+│ K8s docs:  3517      │
+│ Total:     9909      │
+│ Embeddings: 9909     │
+│ (RAG enabled)        │
+╰──────────────────────╯
+```
+
+### How Hybrid Search Works
+
+When you ask a question, K8AI runs both search methods and merges results:
+
+```
+Your question: "my pod keeps crashing with memory errors"
+                         │
+          ┌──────────────┴──────────────┐
+          ▼                             ▼
+   Semantic Search                Keyword Search
+   (RAG embeddings)               (FTS5 BM25)
+          │                             │
+  Converts your question         Matches exact words:
+  to a vector and finds          "crashing", "memory",
+  docs with similar meaning:     "errors"
+  "OOMKilled", "resource         │
+  limits", "memory quotas"       │
+          │                             │
+          └──────────────┬──────────────┘
+                         ▼
+                 Merge + Deduplicate
+                         │
+                         ▼
+              Top 5 results returned
+```
+
+**What semantic search catches that keywords miss:**
+
+| You search for | Keyword finds | Semantic also finds |
+|---|---|---|
+| "memory problem" | docs with word "memory" | OOMKilled, resource limits, container QoS |
+| "pod won't start" | docs with word "start" | ImagePullBackOff, CrashLoopBackOff, scheduling failures |
+| "slow response" | docs with word "slow" | CPU throttling, resource quotas, HPA configuration |
+
+### Cost
+
+- **Sync**: ~$0.01 for all 10,000 chunks (batched, one-time)
+- **Per query**: ~$0.000001 (one embedding call)
+- Embeddings stored locally — no cloud dependency after sync
+
+### Verify RAG Status
+
+```bash
+k8ai kb status
+```
+
+```
+Docs chunks:  9909
+Embeddings:   9909
+RAG:          enabled
+```
+
+If `Embeddings: 0` — either your provider is Claude, or the embedding model isn't deployed.
+
+---
+
 ## Common Workflows
 
 ### Diagnose a failing pod
