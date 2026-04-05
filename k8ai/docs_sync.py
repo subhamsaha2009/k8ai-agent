@@ -15,8 +15,9 @@ import zipfile
 import urllib.request
 from datetime import datetime
 
-from k8ai.kb import add_chunks_bulk, clear_category, get_stats
+from k8ai.kb import add_chunks_bulk, clear_category, get_stats, store_embeddings
 from k8ai.config import CONFIG_DIR
+from k8ai.embeddings import is_embedding_available, get_embeddings_batch
 
 SYNC_STATUS_FILE = os.path.join(CONFIG_DIR, "docs_sync.json")
 
@@ -223,8 +224,80 @@ def sync_k8s_docs(progress_callback=None) -> int:
     return len(all_chunks)
 
 
+def _generate_embeddings(progress_callback=None):
+    """Generate embeddings for all doc chunks that don't have one yet."""
+    import sqlite3
+
+    if not is_embedding_available():
+        if progress_callback:
+            progress_callback("Skipping embeddings (Claude provider — no embedding model)")
+        return 0
+
+    if progress_callback:
+        progress_callback("Generating RAG embeddings...")
+
+    db_path = os.path.join(CONFIG_DIR, "kb.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    # Get chunks without embeddings
+    rows = conn.execute("""
+        SELECT c.id, c.title, c.section, c.content
+        FROM chunks c
+        LEFT JOIN embeddings e ON e.chunk_id = c.id
+        WHERE e.chunk_id IS NULL AND c.category = 'docs'
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        if progress_callback:
+            progress_callback("  All chunks already have embeddings")
+        return 0
+
+    total = len(rows)
+    if progress_callback:
+        progress_callback(f"  {total} chunks need embeddings")
+
+    # Process in batches
+    batch_size = 100
+    generated = 0
+
+    for i in range(0, total, batch_size):
+        batch_rows = rows[i:i + batch_size]
+
+        # Build text for each chunk: title + section + content (truncated)
+        texts = []
+        chunk_ids = []
+        for row in batch_rows:
+            text = f"{row['title']} - {row['section']}\n{row['content'][:500]}"
+            texts.append(text)
+            chunk_ids.append(row["id"])
+
+        vectors = get_embeddings_batch(texts)
+
+        # Store valid embeddings
+        valid_ids = []
+        valid_vecs = []
+        for cid, vec in zip(chunk_ids, vectors):
+            if vec is not None:
+                valid_ids.append(cid)
+                valid_vecs.append(vec)
+
+        if valid_ids:
+            store_embeddings(valid_ids, valid_vecs)
+            generated += len(valid_ids)
+
+        if progress_callback:
+            progress_callback(f"  Embedded {min(i + batch_size, total)}/{total} chunks")
+
+    if progress_callback:
+        progress_callback(f"  RAG ready — {generated} embeddings generated")
+
+    return generated
+
+
 def sync_all(progress_callback=None) -> dict:
-    """Full sync — download AKS + K8s docs, chunk, store."""
+    """Full sync — download AKS + K8s docs, chunk, store, generate embeddings."""
     import json
 
     # Clear existing docs before re-syncing
@@ -233,6 +306,9 @@ def sync_all(progress_callback=None) -> dict:
     aks_count = sync_aks_docs(progress_callback)
     k8s_count = sync_k8s_docs(progress_callback)
 
+    # Generate RAG embeddings
+    emb_count = _generate_embeddings(progress_callback)
+
     # Save sync status
     os.makedirs(CONFIG_DIR, exist_ok=True)
     status = {
@@ -240,6 +316,8 @@ def sync_all(progress_callback=None) -> dict:
         "aks_chunks": aks_count,
         "k8s_chunks": k8s_count,
         "total_chunks": aks_count + k8s_count,
+        "embeddings": emb_count,
+        "rag_enabled": emb_count > 0,
     }
     with open(SYNC_STATUS_FILE, "w") as f:
         json.dump(status, f, indent=2)

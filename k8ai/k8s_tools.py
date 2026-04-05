@@ -1416,20 +1416,31 @@ def analyze_aks_impact(command, resource_group=None, cluster_name=None):
 
 def search_local_docs(query):
     """Search locally synced Azure and Kubernetes documentation.
-    Returns matching doc chunks ranked by relevance.
+    Uses RAG (semantic search) when embeddings are available, with keyword fallback.
     Run 'k8ai docs sync' first to download docs."""
     try:
-        from k8ai.kb import search_docs, is_docs_synced
+        from k8ai.kb import hybrid_search, is_docs_synced, has_embeddings
+        from k8ai.embeddings import is_embedding_available, get_embedding
+
         if not is_docs_synced():
             return {
                 "error": "Docs not synced yet. Run 'k8ai docs sync' to download Azure + K8s docs.",
                 "query": query,
             }
-        results = search_docs(query, limit=5)
+
+        # Generate query embedding for semantic search
+        query_vector = None
+        if is_embedding_available() and has_embeddings():
+            query_vector = get_embedding(query)
+
+        results = hybrid_search(query, query_vector=query_vector, category="docs", limit=5)
+
         if not results:
             # Fallback to online search if local search returns nothing
             return search_azure_docs(query)
-        return {"results": results, "query": query, "source": "local"}
+
+        search_mode = "hybrid (keyword + RAG)" if query_vector else "keyword"
+        return {"results": results, "query": query, "source": "local", "search_mode": search_mode}
     except Exception as e:
         # Fallback to online search on any error
         return search_azure_docs(query)

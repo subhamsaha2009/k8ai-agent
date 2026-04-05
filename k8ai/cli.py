@@ -201,11 +201,18 @@ def _run_docs_sync():
         with console.status("[dim]Syncing docs...[/dim]", spinner="dots"):
             status = sync_all(progress_callback=progress)
 
+        rag_line = ""
+        if status.get("rag_enabled"):
+            rag_line = f"Embeddings: {status['embeddings']} vectors (RAG enabled)\n"
+        else:
+            rag_line = "RAG:       disabled (Claude provider — keyword search only)\n"
+
         console.print(Panel(
             f"[green bold]Docs synced![/green bold]\n\n"
             f"AKS docs:  {status['aks_chunks']} chunks\n"
             f"K8s docs:  {status['k8s_chunks']} chunks\n"
-            f"Total:     {status['total_chunks']} chunks\n\n"
+            f"Total:     {status['total_chunks']} chunks\n"
+            f"{rag_line}\n"
             "Your agent can now search docs offline.\n"
             "Run [bold]k8ai docs sync[/bold] anytime to update.",
             title="[green]Done[/green]",
@@ -249,6 +256,8 @@ def _run_kb_status():
     console.print(f"Incidents:    {stats.get('incident', 0)}")
     console.print(f"Runbooks:     {stats.get('runbook', 0)}")
     console.print(f"Total:        {stats['total']}")
+    console.print(f"Embeddings:   {stats.get('embeddings', 0)}")
+    console.print(f"RAG:          {'enabled' if stats.get('rag_enabled') else 'disabled'}")
     console.print(f"DB size:      {stats.get('db_size_mb', '?')} MB")
     console.print(f"DB path:      {stats.get('db_path', '?')}")
     console.print(f"Azure Search: {'connected' if is_azure_search_configured() else 'not configured'}")
