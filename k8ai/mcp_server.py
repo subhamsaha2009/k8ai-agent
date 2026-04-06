@@ -20,7 +20,12 @@ mcp = FastMCP("k8ai", instructions=(
     "K8s AI Agent — Kubernetes cluster management tools. "
     "Safe commands (get, describe, logs, list) execute immediately. "
     "Destructive commands (delete, scale, drain, etc.) return an impact analysis "
-    "and require you to call confirm_destructive_action(action_id) to proceed."
+    "and require you to call confirm_destructive_action(action_id) to proceed. "
+    "TOOL PRIORITY: When user asks to PERFORM an action (enable, deploy, scale, etc.), "
+    "use the direct tool FIRST (get_az_aks_help → run_az_aks, or run_kubectl). "
+    "NEVER search docs first for actions. Only search docs if the direct tool help "
+    "does not have the answer. For doc search: ALWAYS try search_local_docs first, "
+    "NEVER use search_azure_docs without trying search_local_docs first."
 ))
 
 # ─── Pending destructive actions (Option B safety) ────────────────────────
