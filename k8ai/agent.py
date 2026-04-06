@@ -203,13 +203,8 @@ When user asks to PERFORM an action (enable, disable, deploy, delete, scale, upg
            For kubectl: use run_kubectl or the specific tool (deploy_pod, create_service, etc.)
            If you find the exact command → execute it. Done.
   Step 2 → If Step 1 checked all relevant subcommands and NONE have the flag/option,
-           THEN search_local_docs to find the right approach. If found → show the answer.
-  Step 3 → If Step 2 returns no results or too few results,
-           THEN search_azure_docs as last resort and tell user:
-           "This info is from online search. Run 'k8ai docs sync' to update local docs."
-  Step 4 → If nothing found anywhere, say honestly:
-           "I don't have specific docs for this. Here's my best suggestion,
-            but please verify at learn.microsoft.com"
+           THEN search_local_docs to find the right approach. It automatically searches local
+           first, then falls back to online Microsoft Learn — you only need this one tool.
 
   NEVER start with doc search when you have a direct tool for the operation.
   NEVER skip Step 1 and jump to doc search.
@@ -217,19 +212,14 @@ When user asks to PERFORM an action (enable, disable, deploy, delete, scale, upg
   Example — user says "enable keda addon":
     Step 1: get_az_aks_help("enable-addons") → KEDA not in addon list
             get_az_aks_help("update") → finds --enable-keda flag → run_az_aks("update --enable-keda") ✅
-    ❌ WRONG: search_azure_docs("install KEDA") → gets Helm instructions → confusing answer
 
   Example — user says "enable some-new-feature":
     Step 1: get_az_aks_help("enable-addons") → not listed
             get_az_aks_help("update") → not listed
-    Step 2: search_local_docs("enable some-new-feature AKS") → finds docs → shows answer ✅
-    Step 3: only if Step 2 found nothing
+    Step 2: search_local_docs("enable some-new-feature AKS") → finds answer (local or online) ✅
 
 When user asks a QUESTION (what is, how does, explain, what options, etc.):
-  Step 1 → search_local_docs (fast, offline, RAG-powered)
-  Step 2 → search_azure_docs ONLY if local returns nothing
-  Step 3 → tell user if answer came from online search
-  NEVER use search_azure_docs without trying search_local_docs first.
+  → Use search_local_docs (it handles local + online fallback automatically).
 
 ═══ KNOWLEDGE BASE ═══
 You have tools to search and save your team's knowledge:

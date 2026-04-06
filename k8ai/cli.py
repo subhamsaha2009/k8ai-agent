@@ -22,8 +22,8 @@ MCP_SAFE_TOOLS = [
     "list_namespaces", "get_node_status", "get_node_names",
     "get_service", "get_pod_resource_usage", "get_pod_resource_limits",
     "check_metrics_server", "exec_in_pod", "get_kubelet_logs",
-    "run_kubectl", "create_configmap", "search_azure_docs",
-    "fetch_azure_doc", "get_az_aks_help", "run_az_aks",
+    "run_kubectl", "create_configmap",
+    "get_az_aks_help", "run_az_aks", "search_local_docs",
 ]
 
 

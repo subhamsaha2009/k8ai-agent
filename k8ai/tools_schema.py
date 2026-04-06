@@ -396,40 +396,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "search_azure_docs",
-            "description": "Search official Microsoft Learn documentation for Azure/AKS topics. Use this when you need to find information about AKS features, addons, extensions, best practices, or any Azure topic. Returns search results with titles, URLs, and descriptions. Use fetch_azure_doc to get full content of a specific result.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query. Examples: 'AKS available addons', 'AKS cluster extensions list', 'AKS KEDA addon setup', 'AKS keyvault secrets provider'"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_azure_doc",
-            "description": "Fetch full content of a Microsoft Learn documentation page. Use this after search_azure_docs to get detailed information from a specific doc URL. Returns the document content in markdown format.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "The URL of the Microsoft Learn documentation page to fetch."
-                    }
-                },
-                "required": ["url"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "get_az_aks_help",
             "description": "Get the official help text for any az aks command. ALWAYS call this BEFORE run_az_aks when you are unsure about the correct flags or syntax. This shows all available arguments, required parameters, and examples. Examples: 'update', 'nodepool update', 'nodepool scale', 'enable-addons'.",
             "parameters": {
@@ -472,7 +438,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_local_docs",
-            "description": "Search locally synced Azure AKS and Kubernetes documentation. Use this when the user asks about Azure/AKS features, Kubernetes concepts, how-to guides, or best practices. Searches offline — no internet needed. If docs are not synced, falls back to online search. Prefer this over search_azure_docs.",
+            "description": "Search Azure AKS and Kubernetes documentation. Searches local docs first (fast, offline, RAG-powered), then automatically falls back to online Microsoft Learn if no local results found. This is the ONLY doc search tool you need — it handles the full cascade internally.",
             "parameters": {
                 "type": "object",
                 "properties": {

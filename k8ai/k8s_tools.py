@@ -1415,35 +1415,51 @@ def analyze_aks_impact(command, resource_group=None, cluster_name=None):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def search_local_docs(query):
-    """Search locally synced Azure and Kubernetes documentation.
-    Uses RAG (semantic search) when embeddings are available, with keyword fallback.
-    Run 'k8ai docs sync' first to download docs."""
+    """Search Azure and Kubernetes documentation.
+    Cascade: local (RAG + keyword) → online (Microsoft Learn) → no results.
+    The agent only needs to call this one tool — the cascade is automatic."""
     try:
         from k8ai.kb import hybrid_search, is_docs_synced, has_embeddings
         from k8ai.embeddings import is_embedding_available, get_embedding
 
-        if not is_docs_synced():
-            return {
-                "error": "Docs not synced yet. Run 'k8ai docs sync' to download Azure + K8s docs.",
-                "query": query,
-            }
+        # ── Step 1: Local search (RAG + keyword) ──
+        if is_docs_synced():
+            query_vector = None
+            if is_embedding_available() and has_embeddings():
+                query_vector = get_embedding(query)
 
-        # Generate query embedding for semantic search
-        query_vector = None
-        if is_embedding_available() and has_embeddings():
-            query_vector = get_embedding(query)
+            results = hybrid_search(query, query_vector=query_vector, category="docs", limit=5)
 
-        results = hybrid_search(query, query_vector=query_vector, category="docs", limit=5)
+            if results:
+                search_mode = "hybrid (keyword + RAG)" if query_vector else "keyword"
+                return {"results": results, "query": query, "source": "local", "search_mode": search_mode}
 
-        if not results:
-            # Fallback to online search if local search returns nothing
-            return search_azure_docs(query)
+        # ── Step 2: Online fallback (Microsoft Learn) ──
+        online = search_azure_docs(query)
+        if online and online.get("results"):
+            online["source"] = "online_fallback"
+            online["note"] = "No local results found. These results are from online Microsoft Learn. Run 'k8ai docs sync' to update local docs."
+            return online
+        if online and online.get("content"):
+            online["source"] = "online_fallback"
+            online["note"] = "No local results found. This content is from online Microsoft Learn. Run 'k8ai docs sync' to update local docs."
+            return online
 
-        search_mode = "hybrid (keyword + RAG)" if query_vector else "keyword"
-        return {"results": results, "query": query, "source": "local", "search_mode": search_mode}
+        # ── Step 3: Nothing found anywhere ──
+        return {
+            "query": query,
+            "source": "none",
+            "message": "No results found in local docs or online. Try a different search term, or check learn.microsoft.com directly.",
+        }
     except Exception as e:
-        # Fallback to online search on any error
-        return search_azure_docs(query)
+        # Last resort — try online on any error
+        try:
+            online = search_azure_docs(query)
+            online["source"] = "online_fallback"
+            online["note"] = "Local search failed. Showing online results instead."
+            return online
+        except Exception:
+            return {"error": str(e), "query": query}
 
 
 def search_knowledge_base(query):

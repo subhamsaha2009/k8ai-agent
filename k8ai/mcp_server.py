@@ -23,9 +23,9 @@ mcp = FastMCP("k8ai", instructions=(
     "and require you to call confirm_destructive_action(action_id) to proceed. "
     "TOOL PRIORITY: When user asks to PERFORM an action (enable, deploy, scale, etc.), "
     "use the direct tool FIRST (get_az_aks_help → run_az_aks, or run_kubectl). "
-    "NEVER search docs first for actions. Only search docs if the direct tool help "
-    "does not have the answer. For doc search: ALWAYS try search_local_docs first, "
-    "NEVER use search_azure_docs without trying search_local_docs first."
+    "Check MULTIPLE subcommands (enable-addons, update, nodepool update) before giving up. "
+    "NEVER search docs first for actions. Only use search_local_docs if the direct tool "
+    "does not have the answer — it handles local + online fallback automatically."
 ))
 
 # ─── Pending destructive actions (Option B safety) ────────────────────────
@@ -276,7 +276,7 @@ def delete_service(name: str, namespace: str = "default") -> str:
 
 @mcp.tool()
 def search_local_docs(query: str) -> str:
-    """Search locally synced Azure AKS and Kubernetes documentation. Prefer this over search_azure_docs."""
+    """Search Azure AKS and Kubernetes documentation. Searches local docs first, automatically falls back to online Microsoft Learn if needed."""
     return json.dumps(k8s_tools.search_local_docs(query), default=str)
 
 
@@ -291,18 +291,6 @@ def add_to_knowledge_base(title: str, description: str, resolution: str = "",
                           tags: str = "", category: str = "incident") -> str:
     """Save a resolved incident or team rule to the knowledge base."""
     return json.dumps(k8s_tools.add_to_knowledge_base(title, description, resolution, tags, category), default=str)
-
-
-@mcp.tool()
-def search_azure_docs(query: str) -> str:
-    """Search official Microsoft Learn documentation online (fallback). Prefer search_local_docs."""
-    return json.dumps(k8s_tools.search_azure_docs(query), default=str)
-
-
-@mcp.tool()
-def fetch_azure_doc(url: str) -> str:
-    """Fetch full content of a Microsoft Learn documentation page."""
-    return json.dumps(k8s_tools.fetch_azure_doc(url), default=str)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
