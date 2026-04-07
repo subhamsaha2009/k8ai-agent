@@ -23,7 +23,7 @@ MCP_SAFE_TOOLS = [
     "get_service", "get_pod_resource_usage", "get_pod_resource_limits",
     "check_metrics_server", "exec_in_pod", "get_kubelet_logs",
     "run_kubectl", "create_configmap",
-    "get_az_aks_help", "run_az_aks", "search_local_docs",
+    "get_az_aks_help", "run_az_aks", "run_az", "search_local_docs",
 ]
 
 
@@ -383,6 +383,11 @@ def main():
 
     # k8ai docs sync / status
     if args and args[0] == "docs":
+        # Load config so embedding model is available during sync
+        if is_configured():
+            _cfg = load_config()
+            if _cfg:
+                apply_config_to_env(_cfg)
         if len(args) >= 2 and args[1] == "sync":
             _run_docs_sync()
         elif len(args) >= 2 and args[1] == "status":

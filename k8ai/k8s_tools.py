@@ -1,9 +1,79 @@
 from kubernetes import client, config
+import subprocess
+import time
+import threading
+from k8ai.logging_config import logger
 
-try:
-    config.load_kube_config()
-except Exception as e:
-    print(f"[Warning] Could not load kubeconfig: {e}")
+_current_context_cache = None
+_api_clients_cache = {}  # Cache API clients by context to avoid repeated creation
+_cache_lock = threading.RLock()  # Thread-safe cache access
+
+
+def _get_current_context():
+    """Get the current kubectl context (dynamically, never cached)."""
+    try:
+        result = subprocess.run(
+            ["kubectl", "config", "current-context"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        logger.warning("Timeout getting current kubectl context")
+    except Exception as e:
+        logger.debug(f"Failed to get current kubectl context: {e}")
+    return None
+
+
+def _ensure_correct_context():
+    """Load kube config for the current kubectl context.
+    Call this before making API calls to follow context switches."""
+    global _current_context_cache
+    current = _get_current_context()
+    
+    # Only reload if context changed
+    if current and current != _current_context_cache:
+        try:
+            config.load_kube_config(context=current)
+            _current_context_cache = current
+            # Clear API client cache since context changed
+            with _cache_lock:
+                _api_clients_cache.clear()
+            logger.debug(f"Switched context to: {current}")
+        except Exception as e:
+            logger.error(f"Could not load kubeconfig for context '{current}': {e}", exc_info=False)
+    elif not _current_context_cache:
+        # First load: try with current context, fall back to default
+        try:
+            if current:
+                config.load_kube_config(context=current)
+                _current_context_cache = current
+                logger.debug(f"Loaded kubeconfig for context: {current}")
+            else:
+                config.load_kube_config()
+                logger.debug("Loaded default kubeconfig")
+        except Exception as e:
+            logger.error(f"Could not load kubeconfig: {e}", exc_info=False)
+
+
+def _get_api_client(client_type="CoreV1Api"):
+    """Get a cached Kubernetes API client. Reuses clients across calls (thread-safe)."""
+    with _cache_lock:
+        if client_type not in _api_clients_cache:
+            if client_type == "CoreV1Api":
+                _api_clients_cache[client_type] = client.CoreV1Api()
+            elif client_type == "AppsV1Api":
+                _api_clients_cache[client_type] = client.AppsV1Api()
+            else:
+                raise ValueError(f"Unknown client type: {client_type}")
+        return _api_clients_cache[client_type]
+
+
+# Initialize on module load
+_ensure_correct_context()
+
 
 
 def _sanitize_name(name):
@@ -17,7 +87,8 @@ def _sanitize_name(name):
 
 def list_pods(namespace="default"):
     """List all pods and their current status."""
-    v1 = client.CoreV1Api()
+    start = time.time()
+    v1 = _get_api_client("CoreV1Api")
     pods = v1.list_namespaced_pod(namespace)
     result = []
     for pod in pods.items:
@@ -54,12 +125,22 @@ def list_pods(namespace="default"):
             "node": pod.spec.node_name,
             "containers": container_statuses,
         })
-    return result
+    elapsed = time.time() - start
+    result_meta = {
+        "_meta": {
+            "count": len(result),
+            "namespace": namespace,
+            "response_time_seconds": round(elapsed, 2),
+        },
+        "pods": result,
+    }
+    return result_meta
 
 
 def describe_pod(pod_name, namespace="default"):
     """Get full details and events for a pod — reveals ImagePullBackOff, OOMKilled, CrashLoopBackOff etc."""
-    v1 = client.CoreV1Api()
+    start = time.time()
+    v1 = _get_api_client("CoreV1Api")
     pod = v1.read_namespaced_pod(pod_name, namespace)
     events = v1.list_namespaced_event(
         namespace,
@@ -103,7 +184,7 @@ def describe_pod(pod_name, namespace="default"):
 
 def get_pod_logs(pod_name, namespace="default", lines=100, previous=False):
     """Get logs from a running or recently failed pod."""
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     try:
         logs = v1.read_namespaced_pod_log(
             name=pod_name,
@@ -113,6 +194,7 @@ def get_pod_logs(pod_name, namespace="default", lines=100, previous=False):
         )
         return logs if logs else "(no logs available)"
     except Exception as e:
+        logger.warning(f"Failed to fetch logs for {pod_name}/{namespace}: {e}")
         return f"Error fetching logs: {e}"
 
 
@@ -120,7 +202,7 @@ def deploy_pod(name, image, namespace="default", env_vars=None,
                command=None, memory_limit=None, cpu_limit=None,
                memory_request=None, cpu_request=None):
     """Deploy a new pod to the cluster with optional resource limits and command."""
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
 
     env = []
     if env_vars:
@@ -179,7 +261,7 @@ def deploy_pod(name, image, namespace="default", env_vars=None,
 
 def delete_pod(pod_name, namespace="default"):
     """Delete a pod — forces a restart if managed by a controller."""
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     v1.delete_namespaced_pod(pod_name, namespace)
     return f"Pod '{pod_name}' deleted from namespace '{namespace}'"
 
@@ -187,7 +269,7 @@ def delete_pod(pod_name, namespace="default"):
 def create_configmap(name, html_content, namespace="default"):
     """Create a ConfigMap containing custom HTML content to serve via nginx."""
     name = _sanitize_name(name)
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     configmap = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(name=name, namespace=namespace),
         data={"index.html": html_content},
@@ -199,7 +281,7 @@ def create_configmap(name, html_content, namespace="default"):
 def update_configmap(name, html_content, namespace="default"):
     """Update an existing ConfigMap with new HTML content."""
     name = _sanitize_name(name)
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     configmap = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(name=name, namespace=namespace),
         data={"index.html": html_content},
@@ -214,7 +296,7 @@ def deploy_web_pod(name, namespace="default", configmap_name=None, image="nginx:
     name = _sanitize_name(name)
     if configmap_name:
         configmap_name = _sanitize_name(configmap_name)
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
 
     volumes = []
     volume_mounts = []
@@ -256,7 +338,7 @@ def create_service(name, pod_name, port=80, namespace="default", service_type="L
     """Create a Kubernetes Service to expose a pod. Use service_type='LoadBalancer' for external access via public IP."""
     name = _sanitize_name(name)
     pod_name = _sanitize_name(pod_name)
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     service = client.V1Service(
         metadata=client.V1ObjectMeta(name=name, namespace=namespace),
         spec=client.V1ServiceSpec(
@@ -271,7 +353,7 @@ def create_service(name, pod_name, port=80, namespace="default", service_type="L
 
 def get_service(name, namespace="default"):
     """Get a service and return its external IP (LoadBalancer IP). Poll this after creating a LoadBalancer service."""
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     svc = v1.read_namespaced_service(name, namespace)
     ingress = svc.status.load_balancer.ingress
     external_ip = None
@@ -290,15 +372,31 @@ def get_service(name, namespace="default"):
 
 def delete_service(name, namespace="default"):
     """Delete a Kubernetes Service."""
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     v1.delete_namespaced_service(name, namespace)
     return f"Service '{name}' deleted from namespace '{namespace}'"
 
 
+DIAGNOSTIC_COMMANDS = {
+    "nslookup", "dig", "curl", "wget", "ping", "traceroute", "mtr",
+    "tcpdump", "netstat", "ss", "ip", "iptables", "nc", "nmap",
+}
+
+
 def exec_in_pod(pod_name, command, namespace="default"):
     """Execute a shell command inside a running pod and return the output."""
+    # Guard: redirect diagnostic commands to debug_pod
+    first_word = command.strip().split()[0].lower() if command.strip() else ""
+    if first_word in DIAGNOSTIC_COMMANDS:
+        return {
+            "error": f"'{first_word}' is a diagnostic tool that is NOT available in most app containers. "
+                     f"Use debug_pod(pod_name='{pod_name}', command='{command}') instead — "
+                     f"it attaches a netshoot container that has all network diagnostic tools.",
+            "hint": "debug_pod",
+        }
+
     from kubernetes.stream import stream
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     resp = stream(
         v1.connect_get_namespaced_pod_exec,
         pod_name,
@@ -381,7 +479,7 @@ def get_pod_resource_usage(pod_name=None, namespace="default"):
 
 def get_pod_resource_limits(pod_name, namespace="default"):
     """Get the resource requests and limits configured for a pod (not live usage — what it's allowed to use)."""
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     pod = v1.read_namespaced_pod(pod_name, namespace)
 
     result = []
@@ -510,7 +608,7 @@ def get_kubelet_logs(node_name, lines=100):
 
 def get_node_names():
     """Get list of all node names in the cluster. Use before get_kubelet_logs to find the node name."""
-    v1 = client.CoreV1Api()
+    v1 = _get_api_client("CoreV1Api")
     nodes = v1.list_node()
     return [node.metadata.name for node in nodes.items]
 
@@ -834,25 +932,33 @@ def analyze_impact(command):
 
 def list_namespaces():
     """List all namespaces in the cluster."""
-    v1 = client.CoreV1Api()
-    namespaces = v1.list_namespace()
-    return [ns.metadata.name for ns in namespaces.items]
+    try:
+        v1 = _get_api_client("CoreV1Api")
+        namespaces = v1.list_namespace()
+        return [ns.metadata.name for ns in namespaces.items]
+    except Exception as e:
+        logger.error(f"Failed to list namespaces: {e}")
+        return []
 
 
 def get_node_status():
     """Get status of all nodes in the cluster."""
-    v1 = client.CoreV1Api()
-    nodes = v1.list_node()
-    result = []
-    for node in nodes.items:
-        conditions = {c.type: c.status for c in node.status.conditions}
-        result.append({
-            "name": node.metadata.name,
-            "ready": conditions.get("Ready", "Unknown"),
-            "cpu": node.status.capacity.get("cpu"),
-            "memory": node.status.capacity.get("memory"),
-        })
-    return result
+    try:
+        v1 = _get_api_client("CoreV1Api")
+        nodes = v1.list_node()
+        result = []
+        for node in nodes.items:
+            conditions = {c.type: c.status for c in node.status.conditions}
+            result.append({
+                "name": node.metadata.name,
+                "ready": conditions.get("Ready", "Unknown"),
+                "cpu": node.status.capacity.get("cpu"),
+                "memory": node.status.capacity.get("memory"),
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Failed to get node status: {e}")
+        return []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -885,19 +991,19 @@ def detect_aks_cluster():
     except Exception:
         return {"is_aks": False, "reason": "Could not check cluster type"}
 
-    # Step 2: Use 'az aks show' with context name directly (faster than 'az aks list')
-    # Context name in AKS is typically the cluster name
+    # Step 2: Use 'az aks list' to find cluster, filtering in Python (safe from injection)
     try:
-        # Try to find the cluster by querying az aks list with a JMESPath filter
-        # Use shell=True because 'az' is a .cmd file on Windows
+        # Avoid shell=True + f-strings by filtering results in Python code
         result = subprocess.run(
-            f'az aks list --query "[?name==\'{context_name}\'].{{name:name, resourceGroup:resourceGroup, location:location, kubernetesVersion:kubernetesVersion}}" -o json',
-            capture_output=True, text=True, timeout=60, shell=True
+            ["az", "aks", "list", "-o", "json"],
+            capture_output=True, text=True, timeout=60
         )
         if result.returncode == 0:
             clusters = _json.loads(result.stdout)
-            if clusters:
-                c = clusters[0]
+            # Filter in Python instead of in JMESPath (safer, no injection risk)
+            matching = [c for c in clusters if c.get("name") == context_name]
+            if matching:
+                c = matching[0]
                 return {
                     "is_aks": True,
                     "cluster_name": c["name"],
@@ -1097,24 +1203,48 @@ def get_az_aks_help(subcommand=""):
     """Get the official help text for any az aks command to find correct syntax and flags.
     Examples: get_az_aks_help("update"), get_az_aks_help("nodepool update"), get_az_aks_help("nodepool scale")"""
     import subprocess
+    import shlex
+    import platform
 
-    cmd = f"az aks {subcommand} --help" if subcommand else "az aks --help"
+    parts = shlex.split(subcommand) if subcommand else []
+    cmd_list = ["az", "aks"] + parts + ["--help"]
+    cmd_str_display = " ".join(cmd_list)
+    
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15, shell=True
+        # On Windows, may need shell=True for az.cmd
+        use_shell = platform.system() == "Windows"
+        if use_shell:
+            cmd_to_run = cmd_str_display
+        else:
+            cmd_to_run = cmd_list
+            
+        proc = subprocess.Popen(
+            cmd_to_run, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True, 
+            shell=use_shell
         )
-        output = result.stdout.strip()
-        # Trim to keep it concise — focus on arguments and examples
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()  # clean up
+            logger.warning(f"get_az_aks_help timeout: {cmd_str_display}")
+            return {"error": f"Command timed out after 30s", "command": cmd_str_display}
+
+        output = stdout.strip()
         if len(output) > 3000:
             output = output[:3000] + "\n... (truncated)"
         return {"help": output, "command": cmd}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "command": cmd}
 
 
 def run_az_aks(command, resource_group=None, cluster_name=None):
     """Execute any 'az aks' command. Only works on AKS clusters.
-    resource_group and cluster_name are auto-injected if not in the command."""
+    resource_group and cluster_name are auto-injected if not in the command.
+    Returns full error messages so the agent can understand what went wrong and suggest fixes."""
     import subprocess
     import shlex
 
@@ -1144,17 +1274,28 @@ def run_az_aks(command, resource_group=None, cluster_name=None):
                     cmd += ["--name", cluster_name]
 
     try:
-        # Use shell=True on Windows because 'az' is a .cmd file
-        cmd_str = " ".join(cmd)
+        # Convert command list to string for display/logging
+        cmd_str_display = " ".join(cmd)
+        
+        # On Windows, 'az' is a .cmd file that may need shell=True
+        # On Unix, use list form (safer, no shell injection risk)
+        import platform
+        use_shell = platform.system() == "Windows"
+        
+        if use_shell:
+            cmd_to_run = cmd_str_display
+        else:
+            cmd_to_run = cmd
+            
         result = subprocess.run(
-            cmd_str,
+            cmd_to_run,
             capture_output=True,
             text=True,
             timeout=300,  # AKS operations can take several minutes
-            shell=True,
+            shell=use_shell,
         )
         if result.returncode != 0:
-            return {"error": result.stderr.strip(), "command": cmd_str}
+            return {"error": result.stderr.strip(), "command": cmd_str_display}
 
         # Try to parse JSON output
         output = result.stdout.strip()
@@ -1408,6 +1549,358 @@ def analyze_aks_impact(command, resource_group=None, cluster_name=None):
             f"Check current config: az aks show -g {resource_group} -n {cluster_name}")
 
     return analysis
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GENERIC AZURE CLI
+# ═══════════════════════════════════════════════════════════════════════════
+
+SAFE_AZ_VERBS = {"show", "list", "get"}
+
+
+def run_az(command):
+    """Execute any 'az' command for Azure resource inspection and management.
+    Examples: 'network nsg list --resource-group myRG', 'disk list', 'identity list'."""
+    import subprocess
+    import shlex
+    import platform
+
+    parts = shlex.split(command)
+    cmd = ["az"] + parts
+    cmd_str_display = " ".join(cmd)
+
+    try:
+        # On Windows, 'az' is a .cmd file that may need shell=True
+        # On Unix, use list form (safer, no shell injection risk)
+        use_shell = platform.system() == "Windows"
+        
+        if use_shell:
+            cmd_to_run = cmd_str_display
+        else:
+            cmd_to_run = cmd
+            
+        result = subprocess.run(
+            cmd_to_run,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            shell=use_shell,
+        )
+        if result.returncode != 0:
+            return {"error": result.stderr.strip(), "command": cmd_str_display}
+
+        output = result.stdout.strip()
+        try:
+            import json as _json
+            return {"output": _json.loads(output), "command": cmd_str_display}
+        except Exception:
+            return {"output": output, "command": cmd_str_display}
+
+    except subprocess.TimeoutExpired:
+        return {"error": "Command timed out after 120 seconds", "command": cmd_str_display}
+    except FileNotFoundError:
+        return {"error": "az CLI not found in PATH. Install: https://aka.ms/installazurecli"}
+    except Exception as e:
+        logger.error(f"run_az failed: {e}")
+        return {"error": str(e)}
+
+
+def analyze_az_impact(command):
+    """Analyze impact of a destructive generic az command."""
+    import shlex
+
+    parts = shlex.split(command.lower())
+
+    # Find the verb (last non-flag token before first --flag)
+    verb = None
+    resource_type = []
+    for token in parts:
+        if token.startswith("-"):
+            break
+        verb = token
+        resource_type.append(token)
+
+    resource_path = " ".join(resource_type[:-1]) if len(resource_type) > 1 else "azure resource"
+
+    risk_map = {
+        "delete": "CRITICAL",
+        "purge": "CRITICAL",
+        "remove": "HIGH",
+        "stop": "HIGH",
+        "deallocate": "HIGH",
+        "update": "MEDIUM",
+        "set": "MEDIUM",
+        "create": "MEDIUM",
+        "add": "LOW",
+        "start": "LOW",
+    }
+
+    risk_level = risk_map.get(verb, "MEDIUM")
+
+    analysis = {
+        "command": f"az {command}",
+        "action": verb or "unknown",
+        "resource_type": resource_path,
+        "risk_level": risk_level,
+        "what_this_does": f"Will {verb} on {resource_path}",
+        "direct_impact": [f"Executes '{verb}' operation on Azure {resource_path}"],
+    }
+
+    if verb == "delete":
+        analysis["direct_impact"].append("This will permanently remove the resource")
+        analysis["safer_alternatives"] = ["Consider using 'show' first to verify the target resource"]
+    elif verb in ("stop", "deallocate"):
+        analysis["direct_impact"].append("Resource will become unavailable")
+        analysis["safer_alternatives"] = ["Use 'show' to check current state first"]
+    elif verb == "update":
+        analysis["direct_impact"].append("Resource configuration will be modified")
+        analysis["safer_alternatives"] = ["Use 'show' to check current config first"]
+
+    return analysis
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  INFRASTRUCTURE DEBUGGING TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+
+MAX_OUTPUT_BYTES = 50 * 1024  # 50KB output limit
+
+
+def _resolve_pod_target(command, namespace="default"):
+    """Try to resolve pod names or bare hostnames in a debug command to IPs.
+    If the target looks like a pod name (no dots), check if it exists and get its IP.
+    Returns (resolved_command, resolution_note) or (original_command, None)."""
+    import subprocess
+    import re
+
+    # Extract the target hostname from common diagnostic commands
+    # Patterns: ping <host>, nslookup <host>, curl http://<host>, dig <host>, traceroute <host>
+    # Note: flags like -c 3 have a value after them, so we skip flag+value pairs
+    patterns = [
+        r'(?:ping|traceroute|mtr)\s+(?:-\S+\s+\S+\s+)*(\S+)',
+        r'nslookup\s+(\S+)',
+        r'dig\s+(?:@\S+\s+)?(\S+)',
+        r'curl\s+(?:-\S+\s+(?:\S+\s+)?)*(?:https?://)?([^:/\s]+)',
+        r'wget\s+(?:-\S+\s+(?:\S+\s+)?)*(?:https?://)?([^:/\s]+)',
+    ]
+
+    target = None
+    for pat in patterns:
+        m = re.search(pat, command)
+        if m:
+            target = m.group(1)
+            break
+
+    if not target:
+        return command, None
+
+    # Skip if it's already an IP address
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', target):
+        return command, None
+
+    # Skip if it's a full FQDN with dots (like google.com, svc.cluster.local)
+    if '.' in target:
+        return command, None
+
+    # Bare hostname (no dots) — likely a pod name. Check if it exists.
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "pod", target, "-n", namespace,
+             "-o", "jsonpath={.status.podIP}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pod_ip = result.stdout.strip()
+            resolved_cmd = command.replace(target, pod_ip)
+            note = (
+                f"Auto-resolved: '{target}' is a pod (not a service), so bare name won't resolve via DNS. "
+                f"Replaced with pod IP {pod_ip}. "
+                f"Pod DNS format is: {pod_ip.replace('.', '-')}.{namespace}.pod.cluster.local"
+            )
+            return resolved_cmd, note
+    except Exception:
+        pass
+
+    return command, None
+
+
+def debug_pod(pod_name, command, namespace="default", container=None, image="nicolaka/netshoot"):
+    """Attach an ephemeral debug container to a running pod for network diagnostics.
+    Uses kubectl debug to share the pod's network namespace.
+    Includes dig, nslookup, curl, tcpdump, ping, traceroute, ss, ip, etc."""
+    import subprocess
+    import time
+
+    # Auto-resolve: if command targets a bare pod name, resolve to IP
+    resolved_command, resolution_note = _resolve_pod_target(command, namespace)
+
+    cmd = [
+        "kubectl", "debug", "-i", pod_name,
+        f"--image={image}",
+        "-n", namespace,
+    ]
+
+    if container:
+        cmd.append(f"--target={container}")
+
+    cmd.append("--")
+    cmd.extend(["sh", "-c", resolved_command])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        output = result.stdout.strip()
+        stderr = result.stderr.strip()
+
+        # Filter out kubectl noise (deprecation warnings, profile messages)
+        if stderr:
+            stderr_lines = [l for l in stderr.split("\n")
+                           if not l.strip().startswith("--profile=")
+                           and "is deprecated" not in l]
+            stderr = "\n".join(stderr_lines).strip()
+
+        # For tcpdump, output often goes to stderr
+        if not output and stderr:
+            output = stderr
+            stderr = ""
+
+        # Truncate large output
+        if len(output) > MAX_OUTPUT_BYTES:
+            output = output[:MAX_OUTPUT_BYTES] + f"\n\n... (output truncated at {MAX_OUTPUT_BYTES // 1024}KB)"
+
+        response = {
+            "pod": pod_name,
+            "namespace": namespace,
+            "debug_image": image,
+            "command_run": command,
+            "actual_command": resolved_command if resolved_command != command else None,
+            "output": output if output else "(no output)",
+            "stderr": stderr if stderr else None,
+            "command": " ".join(cmd),
+        }
+
+        if resolution_note:
+            response["resolution"] = resolution_note
+
+        # Smart hint: if DNS failed, explain how Kubernetes DNS works
+        if "does not resolve" in output.lower() or "nxdomain" in output.lower():
+            response["hint"] = (
+                "DNS resolution failed. Kubernetes DNS rules: "
+                "1) Service DNS: <service-name>.<namespace>.svc.cluster.local — ONLY works if a Service exists. "
+                "2) Pod DNS: <pod-ip-with-dashes>.<namespace>.pod.cluster.local (e.g., 10.224.0.47 → 10-224-0-47.default.pod.cluster.local). "
+                "3) Bare pod names (e.g., 'test-pod-2') do NOT resolve — use the pod IP or pod DNS format. "
+                "Get pod IP with: run_kubectl('get pod <name> -o jsonpath={.status.podIP}')"
+            )
+
+        return response
+    except subprocess.TimeoutExpired:
+        return {"error": "Debug command timed out after 120s. For tcpdump, use '-c N' to limit packet count.", "command": " ".join(cmd)}
+    except FileNotFoundError:
+        return {"error": "kubectl not found in PATH"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def debug_node(node_name, command, image="busybox"):
+    """Create a privileged debug pod on a node for host-level diagnostics.
+    Provides access to dmesg, iptables, df, /proc/meminfo, ps, and more.
+    Commands automatically run in the host context via chroot."""
+    import subprocess
+    import json as _json
+    import time
+
+    debug_pod_name = f"node-debug-{node_name.split('-')[-1][:8]}-{int(time.time()) % 10000}"
+
+    # Auto-prepend chroot /host if not already in command
+    if "chroot" not in command and "/host" not in command:
+        exec_command = f"chroot /host sh -c '{command}'"
+    else:
+        exec_command = command
+
+    overrides = _json.dumps({
+        "spec": {
+            "nodeName": node_name,
+            "hostPID": True,
+            "hostNetwork": True,
+            "restartPolicy": "Never",
+            "tolerations": [{"operator": "Exists"}],
+            "containers": [{
+                "name": debug_pod_name,
+                "image": image,
+                "securityContext": {"privileged": True},
+                "command": ["sh", "-c", exec_command],
+                "volumeMounts": [{"name": "host", "mountPath": "/host"}],
+            }],
+            "volumes": [{"name": "host", "hostPath": {"path": "/"}}],
+        }
+    })
+
+    try:
+        # Create the debug pod
+        create = subprocess.run(
+            ["kubectl", "run", debug_pod_name,
+             f"--image={image}",
+             "--restart=Never",
+             f"--overrides={overrides}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if create.returncode != 0:
+            return {"error": f"Failed to create debug pod: {create.stderr.strip()}"}
+
+        # Wait for completion (max 90s)
+        phase = "Unknown"
+        for _ in range(30):
+            time.sleep(3)
+            status = subprocess.run(
+                ["kubectl", "get", "pod", debug_pod_name,
+                 "-o", "jsonpath={.status.phase}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            phase = status.stdout.strip()
+            if phase in ("Succeeded", "Failed"):
+                break
+
+        # Fetch logs (output of the command)
+        logs = subprocess.run(
+            ["kubectl", "logs", debug_pod_name],
+            capture_output=True, text=True, timeout=30,
+        )
+
+        output = logs.stdout.strip() if logs.stdout else "(no output)"
+
+        # Truncate large output
+        if len(output) > MAX_OUTPUT_BYTES:
+            output = output[:MAX_OUTPUT_BYTES] + f"\n\n... (output truncated at {MAX_OUTPUT_BYTES // 1024}KB)"
+
+        return {
+            "node": node_name,
+            "command_run": command,
+            "output": output,
+            "stderr": logs.stderr.strip() if logs.stderr and logs.stderr.strip() else None,
+            "phase": phase,
+        }
+
+    except subprocess.TimeoutExpired:
+        return {"error": "Debug pod timed out. The command may still be running on the node."}
+    except FileNotFoundError:
+        return {"error": "kubectl not found in PATH"}
+    except Exception as e:
+        return {"error": str(e)}
+
+    finally:
+        # Always clean up
+        try:
+            subprocess.run(
+                ["kubectl", "delete", "pod", debug_pod_name, "--ignore-not-found"],
+                capture_output=True, timeout=15,
+            )
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════

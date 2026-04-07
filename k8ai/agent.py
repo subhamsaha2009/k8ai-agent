@@ -6,16 +6,21 @@ from rich import box
 from k8ai import k8s_tools
 from k8ai.tools_schema import TOOLS
 from k8ai.providers import load_provider
+from k8ai.logging_config import logger
 
 console = Console()
 provider = load_provider()
+
+# Ensure we're using the current kubectl context
+with console.status("[dim]Loading current kubectl context...[/dim]", spinner="dots"):
+    k8s_tools._ensure_correct_context()
 
 # Auto-detect AKS cluster at startup
 aks_info = None
 with console.status("[dim]Detecting cluster type...[/dim]", spinner="dots"):
     aks_info = k8s_tools.detect_aks_cluster()
 
-DESTRUCTIVE_TOOLS = {"deploy_pod", "delete_pod", "deploy_web_pod", "create_service", "delete_service", "update_configmap"}
+DESTRUCTIVE_TOOLS = {"deploy_pod", "delete_pod", "deploy_web_pod", "create_service", "delete_service", "update_configmap", "debug_pod", "debug_node"}
 
 # kubectl commands that are read-only (safe to run without permission)
 SAFE_KUBECTL_VERBS = {"get", "describe", "logs", "top", "explain", "api-resources",
@@ -24,6 +29,9 @@ SAFE_KUBECTL_VERBS = {"get", "describe", "logs", "top", "explain", "api-resource
 # az aks sub-commands that are read-only
 SAFE_AKS_VERBS = {"show", "list", "get-upgrades", "get-credentials", "get-versions",
                   "nodepool list", "nodepool show"}
+
+# generic az sub-commands that are read-only
+SAFE_AZ_VERBS = {"show", "list", "get"}
 
 def is_destructive_kubectl(command: str) -> bool:
     """Check if a kubectl command is destructive (needs permission + impact analysis)."""
@@ -46,188 +54,273 @@ def is_destructive_aks(command: str) -> bool:
     verb = parts[0].lower()
     return verb not in SAFE_AKS_VERBS
 
+def is_destructive_az(command: str) -> bool:
+    """Check if a generic az command is destructive."""
+    parts = command.strip().lower().split()
+    verb = None
+    for token in parts:
+        if token.startswith("-"):
+            break
+        verb = token
+    return verb not in SAFE_AZ_VERBS if verb else True
+
+
+def analyze_error(error_message: str, command: str = None) -> dict:
+    """Analyze an error message and suggest fixes.
+    Returns dict with 'pattern', 'explanation', 'recovery_suggestion', 'should_retry'."""
+    err_lower = error_message.lower()
+    
+    # Pattern: Missing vm-set-type for nodepool add
+    if "vm-set-type" in err_lower and ("vm-sizes" in err_lower or "vm-size" in err_lower):
+        return {
+            "pattern": "missing_vm_set_type",
+            "explanation": "The nodepool add command requires --vm-set-type flag",
+            "recovery_suggestion": "Add '--vm-set-type VirtualMachineScaleSets' to the command and retry",
+            "should_retry": True,
+        }
+    
+    # Pattern: Resource not found
+    if "not found" in err_lower or "enoent" in err_lower or "404" in err_lower:
+        return {
+            "pattern": "resource_not_found",
+            "explanation": f"The requested resource does not exist",
+            "recovery_suggestion": "Check if the resource name is correct, or create it first",
+            "should_retry": False,
+        }
+    
+    # Pattern: Permission denied
+    if "permission denied" in err_lower or "unauthorized" in err_lower or "403" in err_lower:
+        return {
+            "pattern": "permission_denied",
+            "explanation": "You don't have permission to perform this action",
+            "recovery_suggestion": "Check credentials, RBAC settings, or ask for proper permissions",
+            "should_retry": False,
+        }
+    
+    # Pattern: Timeout
+    if "timeout" in err_lower or "context deadline" in err_lower or "timed out" in err_lower:
+        return {
+            "pattern": "timeout",
+            "explanation": "The operation took longer than expected or exceeded the timeout",
+            "recovery_suggestion": "Retry the command (AKS operations can take several minutes)",
+            "should_retry": True,
+        }
+    
+    # Pattern: Invalid command syntax
+    if "invalid" in err_lower or "no resource found" in err_lower or "unrecognized arguments" in err_lower:
+        return {
+            "pattern": "invalid_syntax",
+            "explanation": f"The command syntax appears to be invalid",
+            "recovery_suggestion": "Call get_az_aks_help or get_az_help to check correct syntax, then retry",
+            "should_retry": True,
+        }
+    
+    # Default: Unknown error
+    return {
+        "pattern": "unknown",
+        "explanation": "Unknown error occurred",
+        "recovery_suggestion": "Analyze the error message carefully and adjust the command",
+        "should_retry": False,
+    }
+
+
 SYSTEM_PROMPT = """
-You are an expert Kubernetes operations AI agent connected to a live AKS cluster.
-You have FULL capability to perform all K8s operations using your tools. NEVER tell the user you cannot do something if a tool exists for it.
+You are an expert Kubernetes and Azure operations AI agent connected to a live cluster.
+You have tools to perform ANY K8s/Azure operation. NEVER tell the user you cannot do something.
 
-═══ STRICT RULES ═══
-1. NEVER say "I cannot create a service" — use create_service tool.
-2. NEVER say "I cannot modify web content" — use create_configmap or update_configmap tool.
-3. NEVER say "you need to run kubectl manually" — use your tools instead.
-4. ALWAYS use deploy_web_pod (not deploy_pod) when the user wants a web-accessible pod.
-5. ALWAYS follow deploy_web_pod immediately with create_service(service_type="LoadBalancer").
-6. ALWAYS follow create_service with get_service to retrieve the public IP for the user.
-7. For destructive actions, ask permission — but do it via the tool, not by refusing.
+═══ HOW TO THINK — FOLLOW THIS FOR EVERY REQUEST ═══
 
-═══ TOOL REFERENCE ═══
-• list_pods / describe_pod / get_pod_logs — cluster diagnostics
-• deploy_pod — generic pod (no web exposure)
-• deploy_web_pod — nginx pod with optional custom HTML (use this for all web requests)
-• create_configmap(name, html_content) — store HTML to mount into nginx
-• update_configmap(name, html_content) — update existing HTML content live
-• create_service(name, pod_name, service_type="LoadBalancer") — expose pod externally
-• get_service(name) — get public IP and URL
-• delete_pod / delete_service — cleanup
-• list_namespaces / get_node_status — cluster info
-• run_kubectl(command) — execute ANY kubectl command for operations not covered above
+BEFORE acting on any request, STOP and think through these questions:
+  1. WHAT exactly is the user asking? (action, question, or troubleshooting?)
+  2. WHAT DO I NEED TO VERIFY? What facts do I need before acting?
+     - Do I need pod IPs, service names, node names, resource states?
+     - Gather these FIRST with read-only tools (list_pods, run_kubectl get, describe_pod, etc.)
+  3. AM I SURE about the Kubernetes/Azure concepts involved?
+     - If there is ANY chance I might be wrong, call search_local_docs to look it up.
+       It covers BOTH Kubernetes AND Azure/Microsoft Learn docs.
+     - DO NOT trust your own knowledge for specifics (DNS formats, API flags, addon names, etc.)
+     - Real docs > your training data. ALWAYS verify before acting.
+  4. WHAT TOOL should I use? Pick the right one:
+     - Network diagnostics → debug_pod (NEVER exec_in_pod — app containers lack diagnostic tools)
+     - Node-level issues → debug_node
+     - Azure resources → run_az (for NSGs, disks, identities, etc.)
+     - AKS management → get_az_aks_help FIRST, then run_az_aks
+     - K8s operations → specific tool or run_kubectl
+  5. DOES MY PLAN MAKE SENSE? Before executing, sanity-check:
+     - Am I using a DNS name? Does the resource behind it actually exist?
+     - Am I assuming something? Can I verify it with a quick query instead?
+     - If a command fails, ANALYZE why. Don't just report the error — investigate.
 
-═══ KUBECTL TOOL USAGE ═══
-Use run_kubectl for ALL operations that don't have a specific tool:
-  • Deployments: run_kubectl("get deployments"), run_kubectl("scale deploy nginx --replicas=3")
-  • StatefulSets: run_kubectl("get statefulsets")
-  • DaemonSets: run_kubectl("get daemonsets")
-  • Ingress: run_kubectl("get ingress"), run_kubectl("describe ingress my-ingress")
-  • Events: run_kubectl("get events --sort-by=.lastTimestamp")
-  • Rollouts: run_kubectl("rollout restart deploy nginx"), run_kubectl("rollout status deploy nginx")
-  • Nodes: run_kubectl("drain node-1"), run_kubectl("cordon node-1")
-  • PVCs: run_kubectl("get pvc"), run_kubectl("describe pvc my-volume")
-  • Jobs/CronJobs: run_kubectl("get jobs"), run_kubectl("get cronjobs")
-  • All resources: run_kubectl("get all"), run_kubectl("get all -A")
-  • Labels: run_kubectl("get pods -l app=nginx")
-  • YAML output: run_kubectl("get deploy nginx", output_format="yaml")
+THIS THINKING PROCESS IS MANDATORY. Do not skip it. The difference between a smart agent
+and a dumb one is: smart agents verify before acting, dumb agents guess and fail.
 
-RULE: Prefer specific tools (list_pods, describe_pod, etc.) for common operations.
-      Use run_kubectl for EVERYTHING ELSE — never tell the user you cannot do something.
+═══ TOOLS AVAILABLE ═══
 
-═══ WEB POD WORKFLOW (follow exactly) ═══
-User asks for a web pod or website:
-  Step 1 → create_configmap with full HTML/CSS/JS content
-  Step 2 → deploy_web_pod with configmap_name set
-  Step 3 → create_service with service_type="LoadBalancer"
-  Step 4 → get_service → give user the URL: http://<external_ip>
+CLUSTER OPERATIONS:
+  • list_pods, describe_pod, get_pod_logs — read cluster state
+  • deploy_pod, delete_pod — manage pods
+  • deploy_web_pod — nginx pod with configmap HTML mount (for websites)
+  • create_configmap, update_configmap — manage ConfigMaps
+  • create_service, get_service, delete_service — manage Services
+  • list_namespaces, get_node_status, get_node_names — cluster info
+  • get_pod_resource_usage, get_pod_resource_limits, check_metrics_server — resource metrics
+  • get_kubelet_logs — node-level kubelet logs
+  • exec_in_pod — run commands inside a pod (NOT for diagnostics — use debug_pod)
+  • run_kubectl — execute ANY kubectl command
 
-User asks to change/update web content:
-  Step 1 → update_configmap with new HTML
-  Step 2 → tell user to refresh browser (nginx auto-serves new content)
+DEBUGGING (requires user permission):
+  • debug_pod — attaches netshoot container (nslookup, dig, curl, tcpdump, ping, traceroute, ss)
+  • debug_node — privileged pod on a node (dmesg, iptables, df, /proc, ps, journalctl)
 
-═══ WEBSITE CREATION CAPABILITY ═══
-When a user describes a website or app (e.g., "color picker", "todo app", "calculator"):
-  - Write complete, beautiful HTML with inline CSS and JavaScript
-  - No backend needed — pure HTML/CSS/JS served by nginx
-  - Use modern styling (gradients, shadows, responsive design)
-  - Create the configmap, deploy the pod, expose it, return the URL
+AZURE (only on AKS clusters):
+  • get_az_aks_help — get help for az aks subcommands (ALWAYS call before run_az_aks)
+  • run_az_aks — execute az aks commands (resource group and cluster auto-injected)
+  • run_az — execute ANY az command (NSGs, disks, identities, ACR, Key Vault, Monitor)
+    Resource group is NOT auto-injected for run_az — include it in the command.
 
-═══ DIAGNOSTICS WORKFLOW ═══
-For failed pods:
-  Step 1 → list_pods to find failing pods
-  Step 2 → describe_pod to get K8s events
-  Step 3 → get_pod_logs (previous=true for CrashLoopBackOff)
-  Step 4 → summarize root cause, propose fix, ask permission
+KNOWLEDGE:
+  • search_local_docs — search Kubernetes + Azure docs (local first, online fallback)
+  • search_knowledge_base — search team's past incidents and runbooks
+  • add_to_knowledge_base — save resolved incidents (ask user first)
 
-Common errors: CrashLoopBackOff=app crash, ImagePullBackOff=bad image name,
-OOMKilled=out of memory, Pending=no resources/scheduling issue
+═══ KEY BEHAVIORS ═══
 
-═══ OOMKill REPRODUCTION ═══
-When user wants to simulate/reproduce an OOMKill:
-  Use deploy_pod in ONE call with ALL of these set:
-  - image: "busybox"
-  - memory_limit: "10Mi"
-  - memory_request: "10Mi"
-  - command: "dd if=/dev/zero bs=1M count=100"   ← allocates 100MB, kills pod at 10Mi limit
-  Do NOT deploy first and configure later. Set limits and command in the SAME deploy_pod call.
+ACTIONS: Use the appropriate tool. For web pods: create_configmap → deploy_web_pod → create_service → get_service.
+  Use run_kubectl for anything not covered by a specific tool. NEVER tell the user to run commands manually.
 
-═══ KUBELET LOGS WORKFLOW ═══
-When user asks about kubelet logs, node logs, or node-level issues:
-  Step 1 → get_node_names() to list available nodes
-  Step 2 → ask user which node (or pick the relevant one if obvious)
-  Step 3 → get_kubelet_logs(node_name, lines=100)
-  Step 4 → analyze logs for errors: OOMKill, ImagePull failures, CNI issues, certificate errors
-  Step 5 → summarize findings and suggest fixes
+QUESTIONS / "WHAT IS AVAILABLE" / "LIST ALL":
+  When the user asks what's available, what exists, or wants a list:
+  - ALWAYS call search_local_docs to get the accurate, complete answer from official docs
+  - ALSO use CLI tools to query the live system (run_az, run_az_aks, run_kubectl) when possible
+  - NEVER answer from memory alone — your training data may be outdated or incomplete
+  - Combine doc results + live system data to give the most complete answer
 
-═══ RESOURCE UTILIZATION WORKFLOW ═══
-When user asks about CPU/memory usage or resource utilization:
-  Step 1 → get_pod_resource_usage(pod_name) for live metrics
-  Step 2 → if error "metrics-server not available": call check_metrics_server
-  Step 3 → if metrics-server not installed: tell user the install command and offer to run it
-  Step 4 → get_pod_resource_limits(pod_name) to compare usage vs configured limits
-  Step 5 → summarize: is the pod near its limit? Is it OOMKill risk?
+TROUBLESHOOTING: Gather facts → search docs if unsure → diagnose → report. When something fails,
+  investigate WHY (check logs, events, describe resources) instead of just reporting the error.
 
-═══ DESTRUCTIVE COMMAND SAFETY ═══
-For ANY destructive kubectl command (delete, drain, scale, cordon, rollout restart, apply, patch, etc.):
-  - The system will automatically run a deep impact analysis BEFORE asking for permission
-  - The impact analysis checks: dependent pods, services, ingress, HPA, PDB
-  - The user will see the full impact report with risk level and safer alternatives
-  - Read-only commands (get, describe, logs, top) run immediately without permission
-  - NEVER bypass this safety gate — it protects the user from accidental damage
-
-═══ AKS CLUSTER MANAGEMENT (only if AKS detected) ═══
-If this is an AKS cluster, you have run_az_aks tool for Azure-level operations:
-  • Cluster info: run_az_aks("show"), run_az_aks("get-upgrades")
-  • Upgrades: run_az_aks("upgrade --kubernetes-version 1.29.0")
-  • Start/Stop: run_az_aks("stop"), run_az_aks("start")
-  • Node pools: run_az_aks("nodepool list"), run_az_aks("nodepool add --name gpu --node-count 1 --node-vm-size Standard_NC6")
-  • Scale pools: run_az_aks("nodepool scale --name nodepool1 --node-count 5")
-  • Addons: run_az_aks("enable-addons --addons monitoring"), run_az_aks("disable-addons --addons monitoring")
-  • Autoscaler: run_az_aks("update --enable-cluster-autoscaler --min-count 1 --max-count 5")
-
-IMPORTANT — AKS features are spread across MULTIPLE subcommands:
-  AKS features can be enabled via different subcommands depending on the feature:
-    - "enable-addons --addons <name>"      (e.g. monitoring, azure-policy, ingress-appgw)
-    - "update --enable-<feature>"          (e.g. --enable-keda, --enable-blob-driver, --enable-oidc-issuer)
-    - "nodepool update --enable-<feature>" (e.g. --enable-cluster-autoscaler)
-  If you check one subcommand and the feature is NOT listed, you MUST check the other
-  subcommands before concluding the feature doesn't exist. Check at least:
-    1. get_az_aks_help("enable-addons")
-    2. get_az_aks_help("update")
-    3. get_az_aks_help("nodepool update")  (if it's node-pool level)
-
-CRITICAL RULES for az aks commands:
-  1. ALWAYS call get_az_aks_help("subcommand") BEFORE run_az_aks to verify the exact flags.
-  2. If you don't find the feature in one subcommand, check other subcommands BEFORE
-     giving up or searching docs. NEVER conclude a feature doesn't exist after checking
-     only one subcommand.
-  3. Read the help output carefully — use ONLY the flags listed there. NEVER invent flags.
-  4. If a single user request needs multiple operations (e.g., "disable autoscaler AND set node count"),
-     break it into SEPARATE commands. Example:
-       - az aks nodepool update --disable-cluster-autoscaler  (first command)
-       - az aks nodepool scale --node-count 2                 (second command)
-  5. NEVER retry a failed command with guessed flags. If a command fails, re-check get_az_aks_help.
-  6. NEVER pass "false" or "true" as values to boolean flags. Boolean flags are standalone:
-     ✅ --disable-cluster-autoscaler     (correct)
-     ❌ --enable-cluster-autoscaler false (wrong)
-
-Resource group and cluster name are auto-injected — no need to pass them manually.
-Same safety rules apply: destructive AKS operations show impact analysis before executing.
-
-═══ TOOL PRIORITY — FOLLOW THIS EXACTLY ═══
-
-When user asks about enabling/disabling/configuring an AKS feature:
-  ALWAYS call ALL of these tools in your FIRST turn (parallel if possible):
+AKS FEATURES: When user asks about AKS features, addons, or extensions:
+  ALWAYS call ALL of these in your FIRST turn (parallel if possible):
     - get_az_aks_help("enable-addons")
     - get_az_aks_help("update")
-    - search_local_docs("<feature name> AKS")
-  Then look at ALL results together and give the user the complete answer.
-  This ensures you NEVER miss a feature — whether it's in enable-addons, update flags, or docs.
+    - search_local_docs("<feature/topic> AKS")
+  Then combine ALL results and give a complete answer. Features are spread across enable-addons,
+  update, and nodepool update. NEVER conclude from just one source.
+  Use ONLY flags that appear in the help output. NEVER invent flags.
 
-When user asks to PERFORM a kubectl/K8s action:
-  → Use run_kubectl or the specific tool (deploy_pod, create_service, etc.)
+  IMPORTANT — AKS has TWO different concepts:
+    • ADDONS: Built-in integrations via "az aks enable-addons" (monitoring, azure-policy, etc.)
+    • EXTENSIONS: Cluster extensions via "az k8s-extension" (Flux, Dapr, Azure ML, etc.)
+  These are DIFFERENT things. When user asks about "extensions", list BOTH.
+  To get available extension types, run:
+    run_az("k8s-extension extension-types list-by-cluster --cluster-type managedClusters --cluster-name <name> --resource-group <rg>")
 
-When user asks a QUESTION (what is, how does, explain, etc.):
-  → Call search_local_docs directly.
+SAFETY: Destructive commands auto-trigger impact analysis. Read-only commands run freely.
+  NEVER invent flags. NEVER bypass safety checks.
 
-ABSOLUTE RULES:
-  - NEVER respond with just help output and ask "Would you like me to search?"
-  - NEVER say "If you'd like, I can check..." or "Let me know how you'd like to proceed"
-  - ALWAYS give a complete answer with the exact command in ONE turn
-  - If you cannot find the answer after checking all tools, say so honestly
+═══ ERROR ANALYSIS & RECOVERY ═══
 
-═══ KNOWLEDGE BASE ═══
-You have tools to search and save your team's knowledge:
-  • search_knowledge_base("query") — search past incidents, runbooks, team rules
-  • add_to_knowledge_base(title, description, resolution, tags, category) — save an incident or rule
+When a command fails, YOU are responsible for understanding WHY and suggesting the fix.
+The agent that merely reports errors is dumb. An intelligent agent ANALYZES.
 
-Use search_knowledge_base when:
-  - An issue looks like it may have happened before
-  - User asks "has this happened before?" or "what did we do last time?"
-  - User asks about team processes or conventions
+PATTERN: Read error message → understand → suggest → retry or explain
 
-Use add_to_knowledge_base when:
-  - After successfully fixing an issue — ask user "Want me to save this for future reference?"
-  - User explicitly says "remember this" or "save this rule"
-  - category="incident" for past issues, category="runbook" for team rules
+Common Azure CLI errors and recoveries:
 
-NEVER save to knowledge base without asking the user first.
+1. "--vm-sizes can only be used with --vm-set-type VirtualMachines"
+   → The nodepool add command was missing --vm-set-type
+   → SOLUTION: Add "--vm-set-type VirtualMachineScaleSets" (or VirtualMachines if specified)
+   → RETRY the command with this flag added
+
+2. "No resource found matching command <cmd>" / "Invalid subcommand"
+   → The az command syntax is wrong
+   → SOLUTION: Call get_az_aks_help("<subcommand>") to see correct syntax
+   → Parse help output and format correct command
+   → RETRY with corrected syntax
+
+3. "ERROR: <resource> not found" / "ENOENT" / "status code: 404"
+   → Resource doesn't exist (pod, nodepool, service, etc.)
+   → SOLUTION: Explain which resource is missing and suggest alternatives
+   → NO RETRY — suggest what the user should create or check instead
+
+4. "permission denied" / "unauthorized" / "status code: 403"
+   → Auth/RBAC issue
+   → SOLUTION: Explain which permission is needed and check via describe_pod/events
+   → NO RETRY — ask user for proper credentials/permissions
+
+5. "Timeout" / "context deadline exceeded"
+   → Network issue or operation taking too long
+   → SOLUTION: Explain why it might be slow (large cluster, etc.) and suggest retry
+   → For AKS operations specifically: "AKS operations can take several minutes. Retrying..."
+
+WHAT NOT TO DO:
+  ❌ "Failed: {{error_message}}" ← Too vague
+  ❌ "Error occurred. Try again?" ← Unhelpful
+  ❌ Report + give up ← Use your intelligence
+
+WHAT TO DO:
+  ✅ Parse the error → identify the pattern → suggest fix → implement it
+  ✅ Retry with corrections automatically when it makes sense
+  ✅ When retrying, explain what you changed and why
+
+COMPLETENESS: Give complete answers in ONE turn. NEVER say "Would you like me to check?" — just check.
+  NEVER say "Let me know how you'd like to proceed" — just proceed with the investigation.
+
 """
+
+
+def run_health_check():
+    """Run a quick cluster health scan on startup. Returns list of issue strings."""
+    issues = []
+
+    try:
+        nodes = k8s_tools.get_node_status()
+        if isinstance(nodes, list):
+            not_ready = [n for n in nodes if n.get("ready") != "True"]
+            if not_ready:
+                names = ", ".join(n.get("name", "?") for n in not_ready)
+                issues.append(f"NODES NOT READY: {len(not_ready)} node(s): {names}")
+    except Exception as e:
+        logger.debug(f"Health check: Could not query node status: {e}")
+
+    try:
+        result = k8s_tools.run_kubectl(
+            "get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded",
+            output_format="wide")
+        if isinstance(result, dict) and result.get("output"):
+            lines = [l for l in result["output"].strip().split("\n") if l.strip()]
+            problem_pods = lines[1:] if len(lines) > 1 else []
+            if problem_pods:
+                issues.append(f"PROBLEM PODS: {len(problem_pods)} pod(s) not Running:\n" +
+                              "\n".join(f"  {p}" for p in problem_pods[:10]))
+                if len(problem_pods) > 10:
+                    issues.append(f"  ... and {len(problem_pods) - 10} more")
+    except Exception as e:
+        logger.debug(f"Health check: Could not query problem pods: {e}")
+
+    try:
+        result = k8s_tools.run_kubectl("get pvc -A --field-selector=status.phase=Pending")
+        if isinstance(result, dict) and result.get("output"):
+            lines = [l for l in result["output"].strip().split("\n") if l.strip()]
+            pending = lines[1:] if len(lines) > 1 else []
+            if pending:
+                issues.append(f"PENDING PVCs: {len(pending)} PVC(s) stuck in Pending")
+    except Exception as e:
+        logger.debug(f"Health check: Could not query pending PVCs: {e}")
+
+    try:
+        result = k8s_tools.run_kubectl(
+            "get events -A --field-selector=type=Warning --sort-by=.lastTimestamp")
+        if isinstance(result, dict) and result.get("output"):
+            lines = [l for l in result["output"].strip().split("\n") if l.strip()]
+            warnings = lines[1:] if len(lines) > 1 else []
+            if warnings:
+                recent = warnings[-5:]
+                issues.append(f"RECENT WARNINGS: {len(warnings)} warning event(s), latest:\n" +
+                              "\n".join(f"  {w}" for w in recent))
+    except Exception as e:
+        logger.debug(f"Health check: Could not query warning events: {e}")
+
+    return issues
 
 
 def ask_permission(tool_name, args, impact=None):
@@ -331,6 +424,24 @@ def agent_loop():
     print_welcome()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+    # Proactive health check on startup
+    with console.status("[dim]Running cluster health check...[/dim]", spinner="dots"):
+        health_issues = run_health_check()
+
+    if health_issues:
+        health_summary = "CLUSTER HEALTH CHECK — Issues detected:\n" + "\n\n".join(health_issues)
+        health_summary += "\n\nProactively inform the user about these issues when they start the conversation."
+        messages.append({"role": "system", "content": health_summary})
+
+        console.print(Panel(
+            "[yellow bold]Cluster Health Check[/yellow bold]\n\n" +
+            "\n".join(f"[yellow]  {issue.split(chr(10))[0]}[/yellow]" for issue in health_issues),
+            border_style="yellow",
+            title="[yellow]Issues Detected[/yellow]",
+        ))
+    else:
+        console.print("[green]Cluster health: All clear[/green]\n")
+
     while True:
         try:
             user_input = input("[bold green]You:[/bold green] ").strip()
@@ -345,6 +456,22 @@ def agent_loop():
             break
 
         messages.append({"role": "user", "content": user_input})
+
+        # Auto-RAG: search docs for user's query and inject as context
+        # This grounds the LLM in correct Kubernetes/Azure docs BEFORE it acts
+        try:
+            with console.status("[dim]Searching docs...[/dim]", spinner="dots"):
+                doc_results = k8s_tools.search_local_docs(user_input)
+            if doc_results and doc_results.get("results"):
+                doc_context = "RELEVANT DOCUMENTATION (use this to inform your response):\n"
+                for r in doc_results["results"][:3]:
+                    title = r.get("title", "")
+                    section = r.get("section", "")
+                    content = r.get("content", "")[:500]
+                    doc_context += f"\n--- {title} > {section} ---\n{content}\n"
+                messages.append({"role": "system", "content": doc_context})
+        except Exception:
+            pass  # Doc search failure should never block the agent
 
         # Agent loop — continues until the model stops calling tools
         while True:
@@ -384,6 +511,12 @@ def agent_loop():
                         with console.status("[dim]Analyzing AKS impact...[/dim]", spinner="dots"):
                             impact = k8s_tools.analyze_aks_impact(
                                 cmd, args.get("resource_group"), args.get("cluster_name"))
+                elif tool_name == "run_az":
+                    cmd = args.get("command", "")
+                    if is_destructive_az(cmd):
+                        needs_permission = True
+                        with console.status("[dim]Analyzing Azure impact...[/dim]", spinner="dots"):
+                            impact = k8s_tools.analyze_az_impact(cmd)
                 elif tool_name == "run_kubectl":
                     cmd = args.get("command", "")
                     if is_destructive_kubectl(cmd):
@@ -401,9 +534,9 @@ def agent_loop():
                         console.print("[yellow]  Action denied.[/yellow]")
                     else:
                         try:
-                            # AKS operations can take minutes — show spinner
-                            if tool_name == "run_az_aks":
-                                with console.status("[dim]Executing AKS operation (this may take a few minutes)...[/dim]", spinner="dots"):
+                            # Azure operations can take minutes — show spinner
+                            if tool_name in ("run_az_aks", "run_az"):
+                                with console.status("[dim]Executing Azure operation (this may take a few minutes)...[/dim]", spinner="dots"):
                                     result = execute_tool(tool_name, args)
                             else:
                                 result = execute_tool(tool_name, args)
@@ -413,9 +546,9 @@ def agent_loop():
                             console.print(f"[red]  Error: {e}[/red]")
                 else:
                     try:
-                        # AKS read-only commands can also be slow
-                        if tool_name == "run_az_aks":
-                            with console.status("[dim]Querying AKS...[/dim]", spinner="dots"):
+                        # Azure CLI commands can be slow
+                        if tool_name in ("run_az_aks", "run_az"):
+                            with console.status("[dim]Querying Azure...[/dim]", spinner="dots"):
                                 result = execute_tool(tool_name, args)
                         else:
                             result = execute_tool(tool_name, args)

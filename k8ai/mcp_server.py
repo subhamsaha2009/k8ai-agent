@@ -16,6 +16,9 @@ if is_configured():
     if _cfg:
         apply_config_to_env(_cfg)
 
+# Ensure we're using the current kubectl context
+k8s_tools._ensure_correct_context()
+
 mcp = FastMCP("k8ai", instructions=(
     "K8s AI Agent — Kubernetes cluster management tools. "
     "Safe commands (get, describe, logs, list) execute immediately. "
@@ -41,6 +44,8 @@ SAFE_AKS_VERBS = {
     "nodepool list", "nodepool show",
 }
 
+SAFE_AZ_VERBS = {"show", "list", "get"}
+
 
 def _is_destructive_kubectl(command: str) -> bool:
     verb = command.strip().split()[0].lower() if command.strip() else ""
@@ -53,6 +58,16 @@ def _is_destructive_aks(command: str) -> bool:
         if cmd_lower.startswith(safe):
             return False
     return True
+
+
+def _is_destructive_az(command: str) -> bool:
+    parts = command.strip().lower().split()
+    verb = None
+    for token in parts:
+        if token.startswith("-"):
+            break
+        verb = token
+    return verb not in SAFE_AZ_VERBS if verb else True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -271,6 +286,41 @@ def delete_service(name: str, namespace: str = "default") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  INFRASTRUCTURE DEBUGGING TOOLS — always require confirmation
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def debug_pod(pod_name: str, command: str, namespace: str = "default",
+              container: str = None, image: str = "nicolaka/netshoot") -> str:
+    """Attach an ephemeral debug container to a pod for network diagnostics.
+    Returns confirmation prompt — call confirm_destructive_action(action_id) to execute."""
+    action_id = str(uuid.uuid4())[:8]
+    _pending_actions[action_id] = lambda: k8s_tools.debug_pod(
+        pod_name, command, namespace, container, image
+    )
+    return json.dumps({
+        "status": "AWAITING_CONFIRMATION",
+        "action_id": action_id,
+        "message": f"Will attach ephemeral debug container to pod '{pod_name}' in namespace '{namespace}' and run: {command}. Call confirm_destructive_action('{action_id}') to proceed.",
+        "details": {"pod": pod_name, "command": command, "image": image},
+    })
+
+
+@mcp.tool()
+def debug_node(node_name: str, command: str, image: str = "busybox") -> str:
+    """Create a privileged debug pod on a node for host-level diagnostics.
+    Returns confirmation prompt — call confirm_destructive_action(action_id) to execute."""
+    action_id = str(uuid.uuid4())[:8]
+    _pending_actions[action_id] = lambda: k8s_tools.debug_node(node_name, command, image)
+    return json.dumps({
+        "status": "AWAITING_CONFIRMATION",
+        "action_id": action_id,
+        "message": f"Will create privileged debug pod on node '{node_name}' and run: {command}. Call confirm_destructive_action('{action_id}') to proceed.",
+        "details": {"node": node_name, "command": command, "image": image},
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  DOCS + KNOWLEDGE BASE TOOLS — always safe
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -330,6 +380,26 @@ if _aks_info.get("is_aks"):
             "message": "This is a destructive AKS command. Review the impact analysis below, then call confirm_destructive_action(action_id) to execute.",
             "impact_analysis": impact,
             "cluster": {"resource_group": rg, "cluster_name": cn},
+        }, default=str)
+
+    @mcp.tool()
+    def run_az(command: str) -> str:
+        """Execute any 'az' command for Azure resource inspection and management.
+        Use for NSGs, disks, identities, ACR, Key Vault, Monitor, etc.
+        Safe commands (show, list, get) run immediately.
+        Destructive commands return impact analysis — call confirm_destructive_action(action_id) to execute."""
+        if not _is_destructive_az(command):
+            return json.dumps(k8s_tools.run_az(command), default=str)
+
+        impact = k8s_tools.analyze_az_impact(command)
+        action_id = str(uuid.uuid4())[:8]
+        _pending_actions[action_id] = lambda: k8s_tools.run_az(command)
+
+        return json.dumps({
+            "status": "AWAITING_CONFIRMATION",
+            "action_id": action_id,
+            "message": "This is a destructive Azure command. Review the impact analysis below, then call confirm_destructive_action(action_id) to execute.",
+            "impact_analysis": impact,
         }, default=str)
 
 

@@ -437,6 +437,84 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "debug_pod",
+            "description": "Attach an ephemeral debug container to a running pod for network diagnostics. Uses nicolaka/netshoot image which includes dig, nslookup, curl, wget, tcpdump, ping, traceroute, iptables, ss, ip, netstat, and more. This creates an ephemeral container — REQUIRES user permission. For tcpdump, always use '-c N' to limit packet count.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pod_name": {
+                        "type": "string",
+                        "description": "Name of the pod to debug."
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Diagnostic command to run. Examples: 'dig kubernetes.default', 'curl -v http://my-service:8080', 'tcpdump -i eth0 -c 20 -nn', 'ss -tlnp', 'nslookup my-service.default.svc.cluster.local', 'ping -c 3 10.0.0.1', 'traceroute my-service'"
+                    },
+                    "namespace": {
+                        "type": "string",
+                        "description": "Kubernetes namespace. Defaults to 'default'.",
+                        "default": "default"
+                    },
+                    "container": {
+                        "type": "string",
+                        "description": "Target container name for multi-container pods. Shares the container's process namespace. Omit for single-container pods."
+                    },
+                    "image": {
+                        "type": "string",
+                        "description": "Debug container image. Defaults to nicolaka/netshoot.",
+                        "default": "nicolaka/netshoot"
+                    }
+                },
+                "required": ["pod_name", "command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "debug_node",
+            "description": "Create a privileged debug pod on a specific node for host-level diagnostics. Provides access to dmesg, iptables, df, /proc/meminfo, ps, and more. Commands automatically run in the host context via chroot. Use get_node_names first to find the node name. REQUIRES user permission — creates a privileged pod.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_name": {
+                        "type": "string",
+                        "description": "Full name of the node. Use get_node_names() first."
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Host-level command to run. Examples: 'dmesg | tail -50', 'df -h', 'cat /proc/meminfo', 'ps aux | head -20', 'iptables -L -n', 'cat /etc/resolv.conf', 'ss -tlnp', 'journalctl -u containerd -n 50 --no-pager'"
+                    },
+                    "image": {
+                        "type": "string",
+                        "description": "Debug image. Defaults to busybox.",
+                        "default": "busybox"
+                    }
+                },
+                "required": ["node_name", "command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_az",
+            "description": "Execute any 'az' command for Azure resource inspection and management. Use for NSGs, disks, identities, ACR, Key Vault, Monitor, etc. Safe commands (show, list, get) run immediately. Destructive commands return impact analysis first. ONLY available on AKS clusters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The az sub-command WITHOUT 'az' prefix. Examples: 'network nsg list --resource-group myRG', 'disk list --resource-group myRG', 'identity list', 'acr list', 'keyvault list', 'monitor metrics list --resource myVM --resource-type Microsoft.Compute/virtualMachines --metric Percentage_CPU'"
+                    }
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_local_docs",
             "description": "Search Azure AKS and Kubernetes documentation. Searches local docs first (fast, offline, RAG-powered), then automatically falls back to online Microsoft Learn if no local results found. This is the ONLY doc search tool you need — it handles the full cascade internally.",
             "parameters": {
